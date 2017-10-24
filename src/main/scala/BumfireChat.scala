@@ -1,7 +1,11 @@
+import java.util.concurrent.ConcurrentHashMap
+
 import akka.actor.ActorSystem
 import akka.http.scaladsl.Http
+import akka.http.scaladsl.model._
 import akka.http.scaladsl.model.ws.Message
 import akka.http.scaladsl.model.ws.TextMessage.Strict
+import akka.http.scaladsl.server.AuthorizationFailedRejection
 import akka.http.scaladsl.server.Directives._
 import akka.stream._
 import akka.stream.scaladsl.{BroadcastHub, Flow, Keep, MergeHub, Sink}
@@ -10,11 +14,18 @@ import akka.{Done, NotUsed}
 
 import scala.concurrent.duration.{Duration, FiniteDuration}
 import scala.concurrent.{Await, ExecutionContextExecutor, Promise, duration}
+import scala.util.Random
 
 object BumfireChat {
   type ChatMsg = (String, String, String) //message's (type (arrvd/dprtd/msg/ping), chatter, body)
 
-  private case class Config(intf: String = "localhost", port: Int = 8080, wsKeepAliveInSec: Int = 30)
+  private case class Config(intf: String = "localhost", port: Int = 8080, wsKeepAliveInSec: Int = 30,
+                            idLength: Int = 8, tokenLength: Int = 16)
+
+  private val chatters = new ConcurrentHashMap[String, String]
+  private val rand     = new Random
+
+  private def randomToken(len: Int) = rand.alphanumeric.take(len).mkString
 
   def main(args: Array[String]): Unit = new ConfigParser().parse(args, Config()).foreach { implicit conf =>
     implicit val system: ActorSystem = ActorSystem("bumfire")
@@ -25,10 +36,21 @@ object BumfireChat {
     implicit val roomFlow: Flow[ChatMsg, ChatMsg, NotUsed] = Flow.fromSinkAndSource(roomSink, roomSource)
 
     val route =
+      path("chat") { redirect("chat/", StatusCodes.PermanentRedirect) } ~
       pathPrefix("chat") {
-        pathPrefix(Segment) { implicit chatter =>
-          parameter("auth") { authToken => handleWebSocketMessages(wsMessageHandler) }
-        }
+        pathSingleSlash {
+          val chatter   = randomToken(conf.idLength)
+          val authToken = randomToken(conf.tokenLength)
+          if(null == chatters.putIfAbsent(chatter, authToken))
+            complete(customizeForChatter("chat.html", chatter, authToken))
+          else complete(StatusCodes.Conflict)
+        } ~
+          pathPrefix(Segment) { implicit chatter =>
+            parameter("auth") { authToken =>
+              if(chatters.get(chatter) == authToken) handleWebSocketMessages(wsMessageHandler)
+              else reject(AuthorizationFailedRejection)
+            }
+          }
       }
 
     val bindingFuture = Http().bindAndHandle(route, conf.intf, conf.port)
@@ -51,6 +73,18 @@ object BumfireChat {
     )
   }
 
+  private def customizeForChatter(resource: String, chatter: String, authToken: String)(implicit conf: Config) = {
+    val source = scala.io.Source.fromInputStream(getClass.getResourceAsStream(resource), "UTF-8")
+    try {
+      val template = source.getLines().mkString("\n")
+      val body = template.replaceAll("\\{\\{intf\\}\\}",      conf.intf)
+                         .replaceAll("\\{\\{port\\}\\}",      conf.port.toString)
+                         .replaceAll("\\{\\{chatter\\}\\}",   chatter)
+                         .replaceAll("\\{\\{authToken\\}\\}", authToken)
+      HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentType(MediaTypes.`text/html`, HttpCharsets.`UTF-8`), body))
+    } finally source.close()
+  }
+
   private class ConfigParser extends scopt.OptionParser[Config]("Bumfire") {
     head("Bumfire Chat Server")
 
@@ -67,6 +101,14 @@ object BumfireChat {
     opt[Int]('k', "keepalive") action {
       (k, cfg) => cfg.copy(wsKeepAliveInSec = k)
     } text "WS connection keep alive in seconds (30 by default)"
+
+    opt[Int]("idlen") action {
+      (il, cfg) => cfg.copy(idLength = il)
+    } text "the length of random identifiers (8 by default)"
+
+    opt[Int]("toklen") action {
+      (tl, cfg) => cfg.copy(tokenLength = tl)
+    } text "the length of authorization tokens (16 by default)"
   }
 
   private class PresenceStage(chatter: String) extends GraphStage[FlowShape[ChatMsg, ChatMsg]] {
@@ -80,6 +122,11 @@ object BumfireChat {
       override def preStart(): Unit = {
         announceArrival()
         super.preStart()
+      }
+
+      override def postStop(): Unit = {
+        chatters.remove(chatter)
+        super.postStop()
       }
 
       override def onPush(): Unit = push(shape.out, grab(shape.in))
